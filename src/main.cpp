@@ -13,27 +13,23 @@
 #define ESPALEXA_ASYNC //it is important to define this before #include <Espalexa.h>!
 #include "Espalexa.h"
 #include "credentials.h"
+#include "enums.h"
 
-#define MQTT_HOST IPAddress(192, 168, 0, 200)
-#define MQTT_PORT 1883
+#define HOSTNAME        "aspirador-robo"
 
-#define PORT_ASPIRADOR D7
+#define ELEGANTOTA_HTML "<html><head><script>setTimeout(function(){window.location.replace('/update');}, 3000)</script></head>You will be redirected to OTA Update interface in 3s.</html>"
 
-const char* HOSTNAME = "aspirador-robo";
+#define MQTT_HOST       IPAddress(192, 168, 0, 200)
+#define MQTT_PORT       1883
+#define TOPIC_SEND      "aspirador-robo/out"
+#define TOPIC_CMD       "aspirador-robo/in/cmd"
 
-const char* ID_ASPIRADOR = "ASPIRADOR ROBO";
+#define PORT_ASPIRADOR  D7 //digital port connected do relay that cycles the power state
 
-const char* TOPIC_SEND   = "aspirador-robo/out";
-const char* TOPIC_CMD    = "aspirador-robo/in/cmd";
+#define ID_ALEXA        "ASPIRADOR ROBO"
 
-const char* CMD_TURN_ON  = "TURN_ON";
-const char* CMD_TURN_OFF = "TURN_OFF";
-
-
-Espalexa espalexa;
-
-AsyncMqttClient mqttClient;
-Ticker mqttReconnectTimer;
+#define CMD_TURN_ON     "TURN_ON"
+#define CMD_TURN_OFF    "TURN_OFF"
 
 WiFiEventHandler wifiConnectHandler;
 WiFiEventHandler wifiDisconnectHandler;
@@ -41,16 +37,29 @@ Ticker wifiReconnectTimer;
 
 AsyncWebServer server(80);
 
+Espalexa espalexa;
+
+AsyncMqttClient mqttClient;
+Ticker mqttReconnectTimer;
+
 unsigned long ota_progress_millis = 0;
-boolean ligarAspiradorRobo = false;
-boolean desligarAspiradorRobo = false;
+boolean flagTurnDeviceOn = false;
+boolean flagTurnDeviceOff = false;
 
 void initElegantOTA();
 void initAlexa();
-void onAspiradorRoboChange(uint8_t brightness);
+void onAlexaAspiradorRoboChange(uint8_t brightness);
 
 
-
+char* concat(const char *s1, const char *s2)
+{
+    const size_t len1 = strlen(s1);
+    const size_t len2 = strlen(s2);
+    char *result = (char*)malloc(len1 + len2 + 1); // +1 for the null-terminator
+    memcpy(result, s1, len1);
+    memcpy(result + len1, s2, len2 + 1); // +1 to copy the null-terminator
+    return result;
+}
 
 void connectToWifi() {
   Serial.println("Connecting to Wi-Fi...");
@@ -88,15 +97,13 @@ void onMqttConnect(bool sessionPresent) {
 
   mqttClient.subscribe(TOPIC_CMD, 0);
 
-  uint16_t packetIdSub = mqttClient.subscribe("test/lol", 2);
-  Serial.print("Subscribing at QoS 2, packetId: ");
-  Serial.println(packetIdSub);
-  mqttClient.publish("test/lol", 0, true, "test 1");
-  Serial.println("Publishing at QoS 0");
-  uint16_t packetIdPub1 = mqttClient.publish("test/lol", 1, true, "test 2");
+  uint16_t packetIdPub0 = mqttClient.publish(TOPIC_SEND, 0, true, "Test Publishing at QoS 0");
+  Serial.print("Publishing at QoS 0, packetId: ");
+  Serial.println(packetIdPub0);
+  uint16_t packetIdPub1 = mqttClient.publish(TOPIC_SEND, 1, true, "Test Publishing at QoS 1");
   Serial.print("Publishing at QoS 1, packetId: ");
   Serial.println(packetIdPub1);
-  uint16_t packetIdPub2 = mqttClient.publish("test/lol", 2, true, "test 3");
+  uint16_t packetIdPub2 = mqttClient.publish(TOPIC_SEND, 2, true, "Test Publishing at QoS 2");
   Serial.print("Publishing at QoS 2, packetId: ");
   Serial.println(packetIdPub2);
 }
@@ -123,18 +130,32 @@ void onMqttUnsubscribe(uint16_t packetId) {
   Serial.println(packetId);
 }
 
-void interpretCommand(const char* command) {
-  Serial.println("command: ");
-  Serial.println(command);
+void executeCommand(COMMAND_ENUM command) {
+  Serial.print("Executing command: ");
+  Serial.println(COMMAND_STRING[command]);
 
-  if (strcmp(command, CMD_TURN_ON) == 0) {
+  if (command == TURN_ON) {
     Serial.println("Turning on...");
-    ligarAspiradorRobo = true;
+    flagTurnDeviceOn = true;
   }
-  else if (strcmp(command, CMD_TURN_OFF) == 0) {
+  else if (command == TURN_OFF) {
     Serial.println("Turning off...");
-    desligarAspiradorRobo = true;
+    flagTurnDeviceOff = true;
   }
+}
+
+void interpretMqttCommand(char *commandStr) {
+  Serial.print("Interpreting command string: ");
+  Serial.println(commandStr);
+
+  for (int cmd = TURN_ON; cmd <= END; ++cmd)
+  {
+    if (strcmp(commandStr, COMMAND_STRING[cmd]) == 0) {
+      executeCommand((COMMAND_ENUM)cmd);
+      break;
+    }
+  }
+  
 }
 
 void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
@@ -159,10 +180,16 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
     Serial.println("Command message received");
 
     // convert raw payload into null terminated string
-    char dest[len + 1] = { 0 };
-    strncpy(dest, payload, len);
+    char cmdStr[len + 1] = { 0 };
+    strncpy(cmdStr, payload, len);
 
-    interpretCommand(dest);
+    char *message = concat("Command message received from Queue: ", cmdStr);
+
+    mqttClient.publish(TOPIC_SEND, 0, true, message);
+
+    free(message);
+
+    interpretMqttCommand(cmdStr);
   }
 }
 
@@ -205,7 +232,7 @@ void onOTAEnd(bool success) {
 
 void initElegantOTA() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", "<html><head><script>setTimeout(function(){window.location.replace('/update');}, 3000)</script></head>You will be redirected to OTA Update interface in 3s.</html>");
+    request->send(200, "text/html", ELEGANTOTA_HTML);
   });
 
   ElegantOTA.begin(&server);    // Start ElegantOTA
@@ -227,20 +254,32 @@ void initAlexa() {
   });
 
   // Define your devices here.
-  espalexa.addDevice(ID_ASPIRADOR, onAspiradorRoboChange); //simplest definition, default state off
+  espalexa.addDevice(ID_ALEXA, onAlexaAspiradorRoboChange); //simplest definition, default state off
 
   espalexa.begin(&server); //give espalexa a pointer to your server object so it can use your server instead of creating its own
 }
 
-//our callback functions
-void onAspiradorRoboChange(uint8_t brightness) {
+void onAlexaAspiradorRoboChange(uint8_t brightness) {
+
+    COMMAND_ENUM command;
     
     if (brightness == 255) {
-      interpretCommand(CMD_TURN_ON);
+      command = TURN_ON;
     }
     else if (brightness == 0) {
-      interpretCommand(CMD_TURN_OFF);
+      command = TURN_OFF;
+    } else {
+      mqttClient.publish(TOPIC_SEND, 0, true, "Invalid command received from Alexa");
+      return;
     }
+
+    char *message = concat("Command received from Alexa: ", COMMAND_STRING[command]);
+
+    mqttClient.publish(TOPIC_SEND, 0, true, message);
+
+    free(message);
+
+    executeCommand(command);
 }
 
 void setup(void) {
@@ -259,7 +298,7 @@ void setup(void) {
   connectToWifi();
 }
 
-void ligarDesligar() {
+void switchPower() {
   digitalWrite(PORT_ASPIRADOR, LOW);
   digitalWrite(LED_BUILTIN, LOW);
   delay(100);
@@ -272,12 +311,12 @@ void loop(void) {
   espalexa.loop();
   delay(1);
 
-  if (ligarAspiradorRobo) {
-    ligarDesligar();
-    ligarAspiradorRobo = false;
+  if (flagTurnDeviceOn) {
+    switchPower();
+    flagTurnDeviceOn = false;
   }
-  if (desligarAspiradorRobo) {
-    ligarDesligar();
-    desligarAspiradorRobo = false;
+  if (flagTurnDeviceOff) {
+    switchPower();
+    flagTurnDeviceOff = false;
   }
 }
